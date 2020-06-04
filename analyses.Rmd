@@ -1,0 +1,342 @@
+# Modeling Air Quality and COVID-19 Deaths in South Korea
+
+Table of Contents
+
+1. [Background](#bg)
+2. [Data](#dat)
+    i. [Data Preparation](#datprep)
+3. [Model (with interaction terms)](#model1)
+    i. [Model Code](#code1)
+    ii. [Define Model Parameters](#paramdef1)
+    iii. [Run the Model](#run1)
+4. [Results (with interaction terms)](#result1)
+    i. [Trace plots](#plot1)
+    ii. [95% Highest Density Intervals (HDI's)](#hdi1)
+5. [Model (without interaction terms)](#model2)
+    i. [Model Code](#code2)
+    ii. [Define Model Parameters](#paramdef2)
+    iii. [Run the Model](#run2)
+6. [Results (without interaction terms)](#result2)
+    i. [Trace plots](#plot2)
+    ii. [95% Highest Density Intervals (HDI's)](#hdi2)
+7. [Note, Acknowledgements and Footnotes](#end)
+
+## Background {#bg}
+
+The novel coronavirus pandemic has caused over 300,000 deaths around the globe as of May 17th, 2020.[^WHO] Several coronaviruses are known to cause respiratory infections[^WHO2], and people whose lungs are already compromised by existing respiratory diseases are believed to be more susceptible to develop more severe symptoms if they acquire COVID-19[^compromised], the disease caused by the novel coronavirus. There have already been evidence for a number of respiratory and lung diseases that they are associated with exposure to air pollution.[^pulmonary][^respiratory][^pneumonia] This case study investigates the association between air pollution level and COVID-19 deaths in South Korea.
+
+```{r message=FALSE}
+library(nimble)
+library(coda)
+library(dplyr)
+library(HDInterval)
+library(ggplot2)
+library(kableExtra)
+```
+
+## Data {#dat}
+
+```{r}
+path = 'data/cleaned/'
+covid = read.csv(paste0(path, 'covid.csv'))
+covid = covid[, c('province', 'deceased')]
+pop = read.csv(paste0(path, 'SKpopulation.csv'))
+colnames(pop) <- c('province', 'population')
+suiAQ = read.csv(paste0(path, 'suiAQ.csv'))
+elderly = read.csv(paste0(path, 'elderly.csv'))
+elderlyratio = merge(elderly, pop, by = 'province')
+elderlyratio = mutate(elderlyratio, elderlyratio = elderly / population)
+elderlyratio = elderlyratio[, c('province', 'elderlyratio')]
+socio = read.csv(paste0(path, 'socio.csv'))
+socio = socio[, c('province', 'university_count')]
+data = merge(covid, pop, by = 'province') %>% merge(suiAQ) %>% merge(elderlyratio) %>% merge(socio)
+```
+
+```{r results='asis', echo=FALSE}
+knitr::kable(data, caption = "all data") %>% kable_styling(bootstrap_options = c("hover"), full_width = F, position = "left", fixed_thead = T, font_size = 12.5)
+```
+
+Data on COVID-19 deaths[^kaggleCOVID] are collected from the Korea Centers for Disease Control and Prevention[^kcdc] (KCDC). The data contains the number of COVID-19 deaths in each South Korean province-level administrative region as of March 30th, 2020.
+
+```{r results='asis', echo=FALSE}
+knitr::kable(select(data, province, deceased), caption = "COVID-19 mortality data") %>% kable_styling(bootstrap_options = c("hover", "condensed"), full_width = F, position = "left", fixed_thead = T)
+```
+
+Mean daily air pollutant concentrations from 2006 to 2011 are calculated for 5 air quality metrics for each study region. The raw data was obtained from the Korean Ministry of Environment[^ministryofenv] by Kim et al[^suicidepaper]. Carbon monoxide, NO2, ozone, and SO2 are measured in parts per million (ppm), and PM10 is measured in $\mu g/m^3$. 
+
+Although the raw data only span 7 years and do not include measurements in the most recent years, the means aggregated from it are believed to be reasonable indicators of the pollution level in the study regions. First, the raw data boast relatively high temporal and spatial resolution--it come from daily measurements at 251 sites accross South Korea[^suicidepaper], so the means calculated from it are good indicators of the pollution level in the study regions from 2006 to 2011. In addition, the relative pollution levels are assumed to not have drastically changed from before 2006 to the time range of the raw data, or from 2011 to the most recent years. Therefore, the data can indicate the long term pollution level in the study regions.
+
+```{r results='asis', echo=FALSE}
+knitr::kable(data[,c('province', 'co', 'pm10', 'no2', 'ozone', 'so2')], caption = "air quality data") %>% kable_styling(bootstrap_options = c("hover", "condensed"), full_width = F, position = "left", fixed_thead = T)
+```
+
+Additional data on confounding factors including the elderly population ratio and the number of universities[^kaggleSocio] are collected. The elderly population ratio is calculated by dividing the number of population aged 65 years and above in South Korea in 2019[^elderly] by the number of population as of May, 2018[^population].
+
+```{r results='asis', echo=FALSE}
+knitr::kable(data[,c('province', 'elderlyratio', 'university_count')], caption = "socioeconomic data") %>% kable_styling(bootstrap_options = c("hover", "condensed"), full_width = F, position = "left", fixed_thead = T)
+```
+
+### Data Preparation {#datprep}
+
+```{r warning=FALSE}
+## define the data
+y <- data[, 'deceased'] # response
+x <- data[, c('co', 'pm10', 'no2', 'ozone', 'so2', 'elderlyratio', 'university_count')] # predictors
+population <- data[, 'population']
+nX <- ncol(x) # number of covariates
+nTotal <- nrow(x) # number of observations
+
+## standardize the data
+xMean <- rep(0, nX)
+xSD <- rep(0, nX)
+zX <- matrix(0, nrow = nTotal, ncol = nX) # standardized x
+for (j in 1:nX) {
+  xMean[j] <- mean(x[, j])
+  xSD[j]   <-   sd(x[, j])
+  for (i in 1:nTotal) {
+    zX[i, j] <- (x[i, j] - xMean[j]) / xSD[j]
+  }
+}
+
+## find the interacting terms
+interact <- abs(cor(zX)) > 0.6 # indicator matrix of highly correlated covariates 
+ind <- which(interact == TRUE, arr.ind = T); rownames(ind) <- NULL # index  pairs of highly correlated covariates
+uniq <- unique(data.frame(t(apply(ind, 1, sort)))) # unique index pairs
+interactInd <- uniq[uniq$X1 != uniq$X2, ] # excluding interactions with oneselves
+nInt <- nrow(interactInd) # number of interacting terms
+zX1 <- zX[, interactInd$X1]  
+zX2 <- zX[, interactInd$X2]
+
+## define the initial values
+f <- 'y~'
+for (i in 1:nX) { f <- paste0(f,'zX[,',as.character(i),']+') }
+for (r in 1:nInt) { f <- paste0(f,'zX[,',as.character(interactInd[r,1]),']*zX[,',as.character(interactInd[r,2]),']+') }
+f <- paste0(f,'offset(log(population))') # formula
+fit <- glm(formula = f, family = poisson, control = list(maxit = 100)) 
+beta0Init <- coef(fit)[1] # intercept
+betaInits <- coef(fit)[2:(nX+1)] # beta coefficients of the regular terms
+betaIInits <- coef(fit)[(nX+2):(nX+nInt+1)] # beta coefficients of the Interacting terms
+lambdaInits <- rep(mean(y), nTotal)
+```
+
+## Model (with interaction terms) {#model1}
+
+A poisson regression model is fit. Interaction terms are included for covariate pairs whose correlation coefficients are higher than $0.6$. The model is adjusted for population.
+
+For each of the 16 administrative regions in South Korea:
+
+deaths ~ Poisson$(\lambda)$
+
+The expected number of deaths in a region, E(deaths), is $\lambda$, and the model takes the form
+
+$$\begin{align*} log(E(deaths)) &= \beta_0 \\ &+ \beta_1~co + \beta_2~pm_{10} + \beta_3~no_2 + \beta_4~ozone + \beta_5~so_2 \\ &+ \beta_6~elderly~population~ratio + \beta_7~university~counts \\ &+ \beta_8~co*pm_{10} + \beta_9~co*ozone + \beta_{10}~pm_{10}*no_2 + \beta_{11}~no_2*ozone 
+\\ &+ log(population) \end{align*}$$
+
+### Model Code {#code1}
+
+Below is the model code. The likelihoods correspond to the model specified above. Here, `y` is the number of deaths, and each $y_i$ follows a possion distribution with expectation $\lambda_i$. The logs of the $\lambda_i$'s are in turn the sum of the intercept term, the covariate terms, the interaction terms, and the log of the population in the corresponding administrative region. The data `zX`, `zX1`, `zX2` are all standardized. Then, all the beta coefficients are given a $Normal(0, 1)$ prior distribution.
+
+```{r}
+interactCode <- nimbleCode({
+  # likelihoods
+  for (i in 1:nTotal) {
+    y[i] ~ dpois(lambda[i])
+    log(lambda[i]) <- beta0 + sum(beta[1:nX] * zX[i, 1:nX]) + sum(betaI[1:nInt] * (zX1[i, 1:nInt] * zX2[i, 1:nInt])) + log(population[i])
+  }
+  # priors
+  beta0 ~ dnorm(0, 1) # intercept
+  for (j in 1:nX) {
+    beta[j] ~ dnorm(0, 1) # beta coefficients of the regular terms
+  }
+  for (r in 1:nInt) {
+    betaI[r] ~ dnorm(0, 1) # beta coefficients of the Interacting terms
+  }
+})
+```
+
+### Define Model Parameters {#paramdef1}
+
+```{r}
+## data
+interactData <- list(zX = zX, zX1 = zX1, zX2 = zX2, y = y, population = population, xMean = xMean, xSD = xSD)
+
+## constants of the model 
+interactConsts <- list(nTotal = nTotal, nX = nX, nInt = nInt, interactInd = interactInd)
+
+## values to initialize the algorithm
+interactInits <- list(beta0 = beta0Init, beta = betaInits, betaI = betaIInits, lambda = lambdaInits)
+```
+
+### Run the Model {#run1}
+
+```{r}
+outInteract <- nimbleMCMC( code = interactCode, constants = interactConsts,
+                           data = interactData, inits = interactInits,
+                           niter = 22000, nburnin = 2000,
+                           thin = 20, nchains = 1,
+                           monitors = c("beta0", "beta", "betaI"),
+                           samplesAsCodaMCMC = TRUE)
+```
+
+## Results (with interaction terms) {#result1}
+
+```{r}
+summary(outInteract)
+```
+
+### Trace plots {#plot1}
+
+```{r fig1, fig.height = 8, fig.width = 8}
+plot(outInteract)
+```
+
+### 95% Highest Density Intervals (HDI's) {#hdi1}
+
+```{r}
+## calclulate the HDI's
+intHDI <- data.frame(t(apply(outInteract, 2, hdi))) 
+intHDI <- intHDI[-8,] # without the HDI of beta0
+intHDI <- cbind(X = rownames(intHDI), intHDI) 
+
+## name the covariates to be plotted 
+shrtColnames <- c(colnames(x)[1:3], 'ozon', 'so2', 'elder','univ')
+predictors <- c(shrtColnames, paste0(shrtColnames[interactInd$X1],'*',shrtColnames[interactInd$X2]))
+
+## plot the HDI's
+ggplot(intHDI, aes(x=X)) + 
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=.1,size=1, color='black') +
+  geom_hline(yintercept = 0, linetype="dashed", size=0.8) +
+  coord_cartesian(ylim = c(-4, 7), xlim = c(0.5, 11.5), expand = FALSE, clip = "off") +
+  ylab("beta") +
+  annotate(geom = "text", x = seq_len(nrow(intHDI)), y = -4.2, label = predictors, size = 3) +
+  theme_bw() +
+  ggtitle('95% Highest Posterior Density Intervals') + 
+  theme(plot.margin = unit(c(1, 1, 1, 0), "lines"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        plot.title = element_text(hjust = 0.5, size = 18, face = 'bold'),
+        legend.position = "none")
+```
+
+The plot shows the 95% HDI's of the beta coefficients corresponding to different terms. The beta coefficient corresponding to CO is significantly higher than 0, suggesting an association between worse CO pollution and more COVID-19 deaths. Nitrogen dioxide (NO2) level is also found to be positively associated with COVID-19 deaths.
+
+Below is the model without the interaction terms.
+
+## Model (without interaction terms) {#model2}
+
+The model takes the form
+
+$$\begin{align*} log(E(deaths)) &= \beta_0 \\ &+ \beta_1~co + \beta_2~pm_{10} + \beta_3~no_2 + \beta_4~ozone + \beta_5~so_2 \\ &+ \beta_6~elderly~population~ratio + \beta_7~university~counts \\ &+ log(population) \end{align*}$$
+
+### Model Code {#code2}
+
+The likelihoods in the model code below correspond to the new model formula specified above. Again, `y` is the number of deaths, and each $y_i$ follows a possion distribution with expectation $\lambda_i$. The logs of the $\lambda_i$'s, however, are now only the sum of the intercept term, the covariate terms, and the log of the population in the corresponding administrative region. The data and the priors of the beta coefficients are left unchanged.
+
+```{r}
+woInteractCode <- nimbleCode({
+  # likelihoods
+  for (i in 1:nTotal) {
+    y[i] ~ dpois(lambda[i])
+    log(lambda[i]) <- beta0 + sum(beta[1:nX] * zX[i, 1:nX]) + log(population[i])
+  }
+  # priors
+  beta0 ~ dnorm(0, 1) # intercept
+  for (j in 1:nX) {
+    beta[j] ~ dnorm(0, 1) # beta coefficients of the regular terms
+  }
+})
+```
+
+### Define Model Parameters {#paramdef2}
+
+```{r}
+## data
+woInteractData <- list(zX = zX, y = y, population = population, xMean = xMean, xSD = xSD)
+
+## constants of the model 
+woInteractConsts <- list(nTotal = nTotal, nX = nX)
+
+## values to initialize the algorithm
+woInteractInits <- list(beta0 = beta0Init, beta = betaInits, lambda = lambdaInits)
+```
+
+### Run the Model {#run2}
+
+```{r}
+outWoInteract <- nimbleMCMC( code = woInteractCode, constants = woInteractConsts,
+                             data = woInteractData, inits = woInteractInits,
+                             niter = 22000, nburnin = 2000,
+                             thin = 20, nchains = 1,
+                             monitors = c("beta0", "beta"),
+                             samplesAsCodaMCMC = TRUE)
+```
+
+## Results (without interaction terms) {#result2} 
+
+```{r}
+summary(outWoInteract)
+```
+
+### Trace plots {#plot2}
+
+```{r fig2, fig.height = 10.67, fig.width = 8}
+plot(outWoInteract)
+```
+
+### 95% Highest Density Intervals (HDI's) {#hdi2}
+
+```{r}
+## calclulate the HDI's
+woIntHDI <- data.frame(t(apply(outWoInteract, 2, hdi))) 
+woIntHDI <- woIntHDI[-8,] # without the HDI of beta0
+woIntHDI <- cbind(X = rownames(woIntHDI), woIntHDI) 
+
+## name the covariates to be plotted 
+shrtColnames <- c(colnames(x)[1:3], 'ozon', 'so2', 'elder','univ')
+
+## plot the HDI's
+ggplot(woIntHDI, aes(x=X)) + 
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=.1,size=1, color='black') +
+  geom_hline(yintercept = 0, linetype="dashed", size=0.8) +
+  coord_cartesian(ylim = c(-4, 7), xlim = c(0.5, 7.5), expand = FALSE, clip = "off") +
+  ylab("beta") +
+  annotate(geom = "text", x = seq_len(nrow(woIntHDI)), y = -4.2, label = shrtColnames, size = 3) +
+  theme_bw() +
+  ggtitle('95% Highest Posterior Density Intervals') + 
+  theme(plot.margin = unit(c(1, 1, 1, 0), "lines"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        plot.title = element_text(hjust = 0.5, size = 18, face = 'bold'),
+        legend.position = "none")
+```
+
+As in the model with the interaction terms, the beta coefficients corresponding to the level of CO and NO2 pollution are significantly higher than 0, suggesting positive associations between these two air quality metrics and COVID-19 deaths in South Korea.
+
+##### Note {#end}
+
+This case study was conducted by Tianchi Liu as part of the Undergraduate Research Program at the statistics department of the University of California, Berkeley. 
+
+##### Acknowledgments
+
+I would like to express my very great appreciation to Dr. Paganin and Professor Paciorek for their valuable and constructive suggestions during the planning and development of this case study. 
+
+I would also like to extend my thanks to Professor Nolan and Professor Fithian for organizing the Undergraduate Research Program.
+
+[^WHO]: WHO COVID-19 Situation Report https://www.who.int/docs/default-source/coronaviruse/situation-reports/20200517-covid-19-sitrep-118.pdf?sfvrsn=21c0dafe_8
+[^WHO2]: WHO on What is a coronavirus? https://www.who.int/emergencies/diseases/novel-coronavirus-2019/question-and-answers-hub/q-a-detail/q-a-coronaviruses
+[^compromised]: severe symptoms for the immunocompromised https://whyy.org/articles/when-it-comes-to-coronavirus-air-pollution-may-put-marginalized-communities-in-danger/ 
+[^pulmonary]: pulmonary disease & air pollution
+https://respiratory-research.biomedcentral.com/articles/10.1186/1465-9921-6-152 
+[^respiratory]: respiratory tract infections & air pollution https://blog.breezometer.com/coronavirus-air-quality-connection
+[^pneumonia]: hospital admission for pneumonia & air pollution https://www.latimes.com/california/story/2020-03-21/coronavirus-air-pollution-health-risk 
+[^kcdc]: Korea Centers for Disease Control & Prevention (KCDC) http://www.cdc.go.kr/
+[^kaggleCOVID]: COVID-19 deaths data https://www.kaggle.com/kimjihoo/coronavirusdataset?select=TimeProvince.csv 
+[^ministryofenv]: Korean Ministry of Environment http://www.airkorea.or.kr/airkorea/eng/)
+[^suicidepaper]: air quality data https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0117929
+[^elderly]: elderly population data https://www.statista.com/statistics/1085308/south-korea-elderly-population-by-region/
+[^population]: population data https://en.wikipedia.org/wiki/South_Korea#cite_note-163
+[^kaggleSocio]: socioeconomic data https://www.kaggle.com/kimjihoo/coronavirusdataset?select=Region.csv
